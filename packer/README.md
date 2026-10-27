@@ -1,0 +1,14 @@
+# Build versus publication
+
+`make packer-seed && make packer-build` constructs an Ubuntu 24.04 qcow2 under `packer/output-ubuntu2404/`. The Packer builder currently uses `~/.ssh/id_ed25519`; `create-seed.sh` prefers its public key and falls back to RSA. **Use a matching ed25519 pair on the build workstation** until this build configuration is parameterized. The build VM's seed ISO is only for image construction; Terraform injects the deployment public key independently. Validate the resulting image's guest SSH/cloud-init cleanup in a throwaway VM before sharing it. `packer/variables.pkr.hcl` contains declarations not currently wired into the builder; changing them alone has no effect.
+
+Building does **not** install or publish the image for libvirt. On the target workstation, after the operator has prepared a host-owned `base/` directory and verified libvirt read/traversal and AppArmor permissions, publish an actual qcow2 file with:
+
+```sh
+bin/publish-image packer/output-ubuntu2404/<actual-image-filename> \
+  /var/lib/libvirt/images/labs/base v1
+```
+
+The script checks qcow2 format and absence of a backing file, copies into the destination filesystem, and atomically links a versioned `ubuntu-24.04-v1.qcow2` name without replacing an existing file. It prints the SHA-256 digest. Do not reuse version labels or modify published files. The operator must have write access to the `base/` directory (or invoke with appropriate privileges); publication does not create directories or adjust system permissions. Inspect the reported *virtual* capacity with `qemu-img info` and set each VM disk >= that capacity. Record the checksum, source Ubuntu image/checksum and destination path alongside workstation configuration; set `base_image` in `environments/ubuntu-servers/terraform.tfvars` to the published absolute path.
+
+Keep every published image while any qcow2 overlay refers to it, including during restores or ZFS snapshot retention. Treat replacement with a newer image as a separate guest rebuild/data migration; changing a Terraform input is not an in-place image upgrade. A normal Packer build may use additional storage for its cache and intermediate copy; verify free space before building on the ~49 GiB free ZFS host.

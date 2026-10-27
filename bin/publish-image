@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 3 ]]; then
+  echo "Usage: $0 <packer-output.qcow2> <existing-base-directory> <version>" >&2
+  exit 2
+fi
+
+SOURCE="$1"
+DIRECTORY="$2"
+VERSION="$3"
+
+if [[ ! "$VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  echo "Version must contain only letters, digits, dots, underscores or hyphens" >&2
+  exit 2
+fi
+if [[ ! -f "$SOURCE" || ! -d "$DIRECTORY" ]]; then
+  echo "Source file and existing destination directory are required" >&2
+  exit 2
+fi
+
+TARGET="${DIRECTORY%/}/ubuntu-24.04-${VERSION}.qcow2"
+if [[ -e "$TARGET" ]]; then
+  echo "Refusing to overwrite existing image: $TARGET" >&2
+  exit 1
+fi
+
+# Validate before copying; the source must be a standalone qcow2.
+qemu-img info --output=json "$SOURCE" | python3 -c '
+import json, sys
+image = json.load(sys.stdin)
+if image.get("format") != "qcow2" or image.get("backing-filename"):
+    sys.exit("Expected a standalone qcow2 image without a backing file")
+print("Virtual capacity:", image["virtual-size"], "bytes")
+'
+
+# Copy into the same filesystem first; hard-link creation publishes atomically
+# and fails if another operator created the target in the meantime.
+TEMP=$(mktemp "${DIRECTORY%/}/.publish.XXXXXXXX")
+trap 'rm -f -- "$TEMP"' EXIT
+cp -- "$SOURCE" "$TEMP"
+chmod 0444 "$TEMP"
+ln -- "$TEMP" "$TARGET"
+echo "Published $TARGET"
+sha256sum -- "$TARGET"

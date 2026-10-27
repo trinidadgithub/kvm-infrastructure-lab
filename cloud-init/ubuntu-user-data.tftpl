@@ -1,0 +1,17 @@
+#cloud-config
+hostname: ${hostname}
+manage_etc_hosts: true
+users:
+  - name: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: users
+    shell: /bin/bash
+    lock_passwd: true
+    ssh_authorized_keys:
+      - ${public_key}
+ssh_pwauth: false
+disable_root: true
+packages:
+  - qemu-guest-agent
+runcmd:
+  - systemctl enable --now qemu-guest-agent

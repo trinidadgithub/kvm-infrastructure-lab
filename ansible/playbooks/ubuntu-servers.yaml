@@ -1,0 +1,10 @@
+---
+- name: Configure generic Ubuntu servers
+  hosts: ubuntu_servers
+  become: true
+  tasks:
+    - name: Keep the QEMU guest agent enabled and running
+      ansible.builtin.service:
+        name: qemu-guest-agent
+        enabled: true
+        state: started

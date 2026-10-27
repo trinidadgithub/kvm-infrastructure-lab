@@ -25,3 +25,9 @@ variable "cloudinit_data" {
     meta_data = string
   }))
 }
+
+variable "cloudinit_in_pool" {
+  description = "Upload generated cloud-init ISOs into pool-owned volumes (opt-in; existing domains retain their original disk paths)."
+  type        = bool
+  default     = false
+}

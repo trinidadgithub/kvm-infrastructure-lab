@@ -1,0 +1,32 @@
+# Copy to terraform.tfvars on the target workstation and adjust after preflight.
+# This file is an example, not a description of existing host resources.
+pool_path           = "/var/lib/libvirt/images/labs/ubuntu-servers"
+pool_group_id       = "REPLACE_WITH_HOST_LIBVIRT_QEMU_GID"
+base_image          = "/var/lib/libvirt/images/labs/base/ubuntu-24.04-v1.qcow2"
+ssh_public_key_path = "/home/REPLACE_WITH_USER/.ssh/id_ed25519.pub"
+
+network_name = "ubuntu-servers-net"
+bridge_name  = "virbr2"
+network_cidr = "192.168.124.0/24"
+gateway_ip   = "192.168.124.1"
+dhcp_start   = "192.168.124.100"
+dhcp_end     = "192.168.124.200"
+
+vms = {
+  ubuntu-server-01 = {
+    hostname   = "ubuntu-server-01"
+    vcpu       = 2
+    memory_mib = 4096
+    disk_gib   = 20
+    mac        = "52:54:00:bb:00:01"
+    ip         = "192.168.124.10"
+  }
+  ubuntu-server-02 = {
+    hostname   = "ubuntu-server-02"
+    vcpu       = 2
+    memory_mib = 4096
+    disk_gib   = 20
+    mac        = "52:54:00:bb:00:02"
+    ip         = "192.168.124.11"
+  }
+}
