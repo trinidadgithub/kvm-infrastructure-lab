@@ -2,7 +2,7 @@ PACKER_DIR=packer
 TF_DIR=terraform
 ANSIBLE_DIR=ansible
 
-.PHONY: packer-init packer-fmt packer-validate packer-seed packer-build
+.PHONY: packer-init packer-fmt packer-fmt-check packer-validate packer-seed packer-build
 .PHONY: tf-init tf-fmt tf-validate tf-plan tf-apply tf-apply-auto tf-destroy tf-destroy-auto
 .PHONY: ansible-ping ansible-site
 .PHONY: up check ssh-key state-backup snapshot
@@ -92,11 +92,14 @@ packer-init:
 packer-fmt:
 	cd $(PACKER_DIR) && packer fmt .
 
-packer-validate:
+packer-fmt-check:
+	cd $(PACKER_DIR) && packer fmt -check .
+
+packer-validate: packer-seed
 	cd $(PACKER_DIR) && packer validate .
 
 packer-seed:
-	$(PACKER_DIR)/create-seed.sh
+	cd $(PACKER_DIR) && ./create-seed.sh
 
 packer-build: packer-seed
 	cd $(PACKER_DIR) && packer build .
