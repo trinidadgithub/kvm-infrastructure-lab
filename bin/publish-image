@@ -20,26 +20,57 @@ if [[ ! -f "$SOURCE" || ! -d "$DIRECTORY" ]]; then
 fi
 
 TARGET="${DIRECTORY%/}/ubuntu-24.04-${VERSION}.qcow2"
-if [[ -e "$TARGET" ]]; then
+if [[ -e "$TARGET" || -L "$TARGET" ]]; then
   echo "Refusing to overwrite existing image: $TARGET" >&2
   exit 1
 fi
 
-# Validate before copying; the source must be a standalone qcow2.
-qemu-img info --output=json "$SOURCE" | python3 -c '
+validate_image() {
+  local image="$1"
+  local details
+  if ! details=$(qemu-img info --output=json "$image"); then
+    echo "Cannot inspect qcow2 image: $image" >&2
+    return 1
+  fi
+  if ! python3 -c '
 import json, sys
 image = json.load(sys.stdin)
 if image.get("format") != "qcow2" or image.get("backing-filename"):
     sys.exit("Expected a standalone qcow2 image without a backing file")
 print("Virtual capacity:", image["virtual-size"], "bytes")
-'
+' <<< "$details"; then
+    echo "Invalid qcow2 image: $image" >&2
+    return 1
+  fi
+  if ! qemu-img check -q -f qcow2 "$image"; then
+    echo "qcow2 integrity check failed: $image" >&2
+    return 1
+  fi
+}
+
+validate_image "$SOURCE"
+SOURCE_HASH=$(sha256sum -- "$SOURCE")
+SOURCE_HASH=${SOURCE_HASH:0:64}
 
 # Copy into the same filesystem first; hard-link creation publishes atomically
 # and fails if another operator created the target in the meantime.
 TEMP=$(mktemp "${DIRECTORY%/}/.publish.XXXXXXXX")
 trap 'rm -f -- "$TEMP"' EXIT
 cp -- "$SOURCE" "$TEMP"
+COPIED_HASH=$(sha256sum -- "$TEMP")
+COPIED_HASH=${COPIED_HASH:0:64}
+SOURCE_HASH_AFTER=$(sha256sum -- "$SOURCE")
+SOURCE_HASH_AFTER=${SOURCE_HASH_AFTER:0:64}
+if [[ "$SOURCE_HASH" != "$COPIED_HASH" ]]; then
+  echo "Checksum mismatch: temporary image differs from source; publication aborted" >&2
+  exit 1
+fi
+if [[ "$SOURCE_HASH" != "$SOURCE_HASH_AFTER" ]]; then
+  echo "Checksum mismatch: source changed during copy; publication aborted" >&2
+  exit 1
+fi
+validate_image "$TEMP"
 chmod 0444 "$TEMP"
 ln -- "$TEMP" "$TARGET"
 echo "Published $TARGET"
-sha256sum -- "$TARGET"
+echo "SHA-256: $COPIED_HASH"
