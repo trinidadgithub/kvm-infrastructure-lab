@@ -55,6 +55,20 @@ resource "libvirt_domain" "vm" {
   }
 
   devices = {
+    channels = var.enable_guest_agent ? [
+      {
+        source = {
+          unix = {
+            mode = "bind"
+          }
+        }
+        target = {
+          virt_io = {
+            name = "org.qemu.guest_agent.0"
+          }
+        }
+      }
+    ] : []
     disks = [
       {
         source = {
@@ -88,11 +102,18 @@ resource "libvirt_domain" "vm" {
         model = { type = "virtio" }
       },
     ]
-    consoles = [
+    consoles = var.enable_serial_console ? [
       {
-        source = { pty = { path = "" } }
-        target = { type = "serial", port = 0 }
+        source = {
+          pty = {
+            path = ""
+          }
+        }
+        target = {
+          type = "serial"
+          port = 0
+        }
       },
-    ]
+    ] : []
   }
 }

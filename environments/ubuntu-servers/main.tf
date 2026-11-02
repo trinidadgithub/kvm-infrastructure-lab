@@ -96,10 +96,12 @@ resource "libvirt_network" "ubuntu_servers" {
 module "compute" {
   source = "../../terraform/modules/compute"
 
-  vms               = local.compute_vms
-  pool_name         = libvirt_pool.ubuntu_servers.name
-  network_name      = libvirt_network.ubuntu_servers.name
-  base_image        = var.base_image
-  cloudinit_data    = local.cloudinit_data
-  cloudinit_in_pool = true
+  vms                   = local.compute_vms
+  pool_name             = libvirt_pool.ubuntu_servers.name
+  network_name          = libvirt_network.ubuntu_servers.name
+  base_image            = var.base_image
+  cloudinit_data        = local.cloudinit_data
+  cloudinit_in_pool     = true
+  enable_guest_agent    = true
+  enable_serial_console = false
 }

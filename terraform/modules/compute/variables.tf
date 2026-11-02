@@ -31,3 +31,15 @@ variable "cloudinit_in_pool" {
   type        = bool
   default     = false
 }
+
+variable "enable_guest_agent" {
+  description = "Expose the QEMU guest-agent virtio channel to guest VMs."
+  type        = bool
+  default     = false
+}
+
+variable "enable_serial_console" {
+  description = "Configure an explicit PTY-backed serial console."
+  type        = bool
+  default     = true
+}
