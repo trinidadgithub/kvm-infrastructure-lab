@@ -37,7 +37,11 @@ def main():
         print(json.dumps({"ansible_host": ips[sys.argv[2]]} if sys.argv[2] in ips else {}))
         return 0
 
-    group_vars = {"ansible_user": "ubuntu"}
+    group_vars = {
+        "ansible_user": "ubuntu",
+        "ansible_python_interpreter": "/usr/bin/python3",
+    }
+
     if os.environ.get("ANSIBLE_PRIVATE_KEY_FILE"):
         group_vars["ansible_ssh_private_key_file"] = os.environ["ANSIBLE_PRIVATE_KEY_FILE"]
 

@@ -1,0 +1,12 @@
+---
+ubuntu_baseline_packages:
+  - ca-certificates
+  - curl
+  - git
+  - htop
+  - jq
+  - unzip
+  - vim
+  - wget
+
+ubuntu_baseline_manage_guest_agent: true
