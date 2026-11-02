@@ -1,0 +1,234 @@
+#!/usr/bin/python3
+"""Fail-closed controller for this repository's named infrastructure operations."""
+
+import fcntl
+import json
+import os
+import pwd
+import re
+import shlex
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+CONFIG = ROOT / ".local-tools.json"
+ENVIRONMENTS = {
+    "k3s-lab": ROOT / "terraform",
+    "ubuntu-servers": ROOT / "environments" / "ubuntu-servers",
+}
+OPERATIONS = {"apply", "destroy", "configure", "snapshot", "build", "up"}
+SYSTEM_URI = "qemu:///system"
+
+
+class Refused(Exception):
+    """A request did not pass preflight or approval."""
+
+
+class ChildFailed(Exception):
+    """A selected tool ran but returned a failure status."""
+
+    def __init__(self, status):
+        self.status = status
+
+
+def tool(config, name):
+    entries = config.get("executables")
+    if not isinstance(entries, dict):
+        raise Refused(f"Configure executables in {CONFIG}")
+    entry = entries.get(name)
+    if not isinstance(entry, dict):
+        raise Refused(f"Missing executable {name} in {CONFIG}")
+    path, expected = entry.get("path"), entry.get("resolved")
+    if not isinstance(path, str) or not isinstance(expected, str):
+        raise Refused(f"Configure absolute path and resolved path for {name}")
+    if not Path(path).is_absolute() or not Path(expected).is_absolute():
+        raise Refused(f"Executable paths for {name} must be absolute")
+    try:
+        actual = Path(path).resolve(strict=True)
+    except OSError as exc:
+        raise Refused(f"Cannot resolve {name}: {exc}") from exc
+    if str(actual) != expected or not actual.is_file() or not os.access(actual, os.X_OK):
+        raise Refused(f"{name} changed or is not executable: expected {expected}, got {actual}")
+    return str(actual)
+
+
+def child_environment(config, operation, environment):
+    user = pwd.getpwuid(os.getuid())
+    result = {
+        "HOME": user.pw_dir,
+        "USER": user.pw_name,
+        "LOGNAME": user.pw_name,
+        "PATH": "/usr/bin:/bin",
+        "LANG": "C.UTF-8",
+    }
+    for name in ("TERM", "SSH_AUTH_SOCK"):
+        if name in os.environ:
+            result[name] = os.environ[name]
+    if operation in ("build",):
+        key = os.environ.get("PKR_VAR_ssh_private_key", "")
+        if not Path(key).is_absolute() or not Path(key).is_file():
+            raise Refused("Set PKR_VAR_ssh_private_key to an existing absolute build key")
+        result["PKR_VAR_ssh_private_key"] = key
+    if environment == "k3s-lab" and operation in ("apply", "destroy", "up"):
+        temp = config.get("k3s_tmpdir")
+        if not isinstance(temp, str) or not Path(temp).is_absolute():
+            raise Refused("Configure an absolute k3s_tmpdir in .local-tools.json")
+        result["TMPDIR"] = temp
+    if operation == "configure" or operation == "up":
+        result["ANSIBLE_ROLES_PATH"] = str(ROOT / "ansible" / "roles")
+    return result
+
+
+def run(command, *, cwd, env):
+    print(f"Executing: {shlex.join(command)} (cwd={cwd})", flush=True)
+    completed = subprocess.run(command, cwd=cwd, env=env, check=False)
+    status = completed.returncode if completed.returncode >= 0 else 128 - completed.returncode
+    print(f"Result: {shlex.join(command)} exited {status}", flush=True)
+    if status:
+        raise ChildFailed(status)
+
+
+def confirm(token, description):
+    if not sys.stdin.isatty():
+        raise Refused("Approval requires an interactive terminal")
+    print(f"Target: {description}", file=sys.stderr)
+    print(f'Type exactly "{token}" to authorize: ', end="", file=sys.stderr, flush=True)
+    try:
+        response = input()
+    except EOFError as exc:
+        raise Refused("No approval received (EOF)") from exc
+    if response != token:
+        raise Refused("Approval refused or invalid")
+
+
+def snapshot_vm(name, terraform, virsh, root, env):
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", name):
+        raise Refused("Specify a single valid VM name")
+
+    def output(key):
+        command = [terraform, f"-chdir={root}", "output", "-json", key]
+        data = subprocess.run(command, cwd=ROOT, env=env, capture_output=True, text=True, check=False)
+        if data.returncode:
+            raise Refused(f"Cannot read {key} from {root}: exit {data.returncode}")
+        try:
+            return json.loads(data.stdout)
+        except json.JSONDecodeError as exc:
+            raise Refused(f"Invalid Terraform output {key}") from exc
+
+    names = output("vm_names")
+    if not isinstance(names, list) or name not in names:
+        raise Refused(f"{name} is not owned by {root}")
+    uuids = output("vm_uuids")
+    if not isinstance(uuids, dict):
+        raise Refused(f"Invalid VM UUID output from {root}")
+    expected = uuids.get(name)
+    actual = subprocess.run([virsh, "-c", SYSTEM_URI, "domuuid", name],
+                            env=env, capture_output=True, text=True, check=False)
+    if not expected or actual.returncode or actual.stdout.strip() != expected:
+        raise Refused(f"Domain UUID for {name} does not match {root}")
+    return expected
+
+
+def main():
+    if len(sys.argv) != 3 or sys.argv[1] not in OPERATIONS | {"validate-tools"}:
+        raise Refused("Usage: bin/operate <apply|destroy|configure|snapshot|build|up|validate-tools> <environment>")
+    operation, environment = sys.argv[1:]
+    if environment not in ENVIRONMENTS:
+        raise Refused(f"Unknown environment: {environment}")
+    if operation == "build" and environment != "ubuntu-servers":
+        raise Refused("Image builds are selected with ubuntu-servers")
+    if operation == "up" and environment != "k3s-lab":
+        raise Refused("up is K3s-only")
+
+    # The config/lock paths are anchored to this controller, never to cwd or HOME.
+    try:
+        config = json.loads(CONFIG.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise Refused(f"Configure and review {CONFIG}: {exc}") from exc
+    if not isinstance(config, dict):
+        raise Refused(f"Expected a JSON object in {CONFIG}")
+    if operation == "validate-tools":
+        for name in ("terraform", "virsh", "ansible_playbook", "packer"):
+            print(f"{name}: {tool(config, name)}")
+        print(f"Environment: {environment}; root: {ENVIRONMENTS[environment]}")
+        return 0
+    lock = ROOT / ".local-operations.lock"
+    with lock.open("a+") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise Refused("Another operation controller is active in this checkout") from exc
+        root = ENVIRONMENTS[environment]
+        needed = {
+            "apply": ("terraform",), "destroy": ("terraform",),
+            "configure": ("ansible_playbook",), "build": ("packer",),
+            "snapshot": ("terraform", "virsh"),
+            "up": ("terraform", "virsh", "ansible_playbook"),
+        }[operation]
+        tools = {name: tool(config, name) for name in needed}
+        env = child_environment(config, operation, environment)
+        if environment == "k3s-lab" and operation in ("apply", "destroy", "up"):
+            if not Path(env["TMPDIR"]).is_dir():
+                raise Refused(f"K3s temporary directory must already exist: {env['TMPDIR']}")
+        if operation in ("apply", "destroy", "up") and not (root / "terraform.tfstate").is_file():
+            raise Refused(f"State missing for {environment}; refusing to manage existing infrastructure")
+
+        if operation == "build":
+            command = [tools["packer"], "build", "."]
+            description = (f"Ubuntu image build; cwd={ROOT / 'packer'}; "
+                           f"seed={ROOT / 'packer' / 'create-seed.sh'}; command={shlex.join(command)}")
+            confirm("build ubuntu-servers", description)
+            run(["/bin/bash", str(ROOT / "packer" / "create-seed.sh")], cwd=ROOT / "packer", env=env)
+            run(command, cwd=ROOT / "packer", env=env)
+        elif operation in ("apply", "destroy"):
+            command = [tools["terraform"], f"-chdir={root}", operation]
+            confirm(f"{operation} {environment}", f"state={root / 'terraform.tfstate'}; command={shlex.join(command)}")
+            run(command, cwd=ROOT, env=env)
+        elif operation == "configure":
+            command = [tools["ansible_playbook"], "-i",
+                       "inventories/terraform.py" if environment == "k3s-lab" else "inventories/ubuntu-servers.py",
+                       "playbooks/site.yaml" if environment == "k3s-lab" else "playbooks/ubuntu-servers.yaml"]
+            confirm(f"configure {environment}", f"inventory/playbook={shlex.join(command)}; cwd={ROOT / 'ansible'}")
+            run(command, cwd=ROOT / "ansible", env=env)
+        elif operation == "snapshot":
+            name = os.environ.get("VM", "")
+            expected_uuid = snapshot_vm(name, tools["terraform"], tools["virsh"], root, env)
+            command = [tools["virsh"], "-c", SYSTEM_URI, "snapshot-create-as", name,
+                       f"snap-{datetime.now().strftime('%Y%m%d-%H%M%S')}", "--atomic"]
+            confirm(f"snapshot {environment} {name}",
+                    f"verified VM={name}, UUID={expected_uuid}, state={root}; command={shlex.join(command)}")
+            run(command, cwd=ROOT, env=env)
+        else:  # up: one process, independent approvals and no rollback
+            run([tools["virsh"], "-c", SYSTEM_URI, "pool-info", "lab"], cwd=ROOT, env=env)
+            key = config.get("k3s_ssh_public_key")
+            if not isinstance(key, str) or not Path(key).is_absolute() or not Path(key).is_file():
+                raise Refused("Configure an existing absolute k3s_ssh_public_key")
+            tf = [tools["terraform"], f"-chdir={root}", "apply"]
+            confirm("apply k3s-lab", f"state={root / 'terraform.tfstate'}; command={shlex.join(tf)}")
+            run(tf, cwd=ROOT, env=env)
+            ansible = [tools["ansible_playbook"], "-i", "inventories/terraform.py", "playbooks/site.yaml"]
+            confirm("configure k3s-lab", f"cwd={ROOT / 'ansible'}; command={shlex.join(ansible)}")
+            run(ansible, cwd=ROOT / "ansible", env=env)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("Interrupted before completion", file=sys.stderr)
+        sys.exit(130)
+    except Refused as exc:
+        print(f"Refused: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except ChildFailed as exc:
+        sys.exit(exc.status)
+    except OSError as exc:
+        print(f"Operation could not start or complete: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as exc:
+        print(f"Unexpected controller error ({type(exc).__name__}): {exc}", file=sys.stderr)
+        sys.exit(1)

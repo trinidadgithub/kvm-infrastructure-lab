@@ -1,6 +1,6 @@
 # Ubuntu Server environment (independent state)
 
-This Terraform root creates two example Ubuntu 24.04 guests on a dedicated libvirt NAT network and in a dedicated `dir` pool. It does not reference the K3s root, its state, network or pool. The VM map in `terraform.tfvars.example` is adjustable; it is not an inventory of running VMs. The existing `terraform/` K3s root remains where it is.
+This Terraform root manages two Ubuntu 24.04 guests on a dedicated libvirt NAT network and in a dedicated `dir` pool, as reported by the operator. It does not reference the K3s root, its state, network or pool. The VM map in `terraform.tfvars.example` is adjustable; it is not an inventory of running VMs. The existing `terraform/` K3s root remains where it is. For the current operational baseline, PTY issue and Makefile P0 safety notice, start with [engineering continuity](../../docs/ENGINEERING-CONTINUITY.md).
 
 ## Storage decision and ownership
 
@@ -45,7 +45,9 @@ make ENV=ubuntu-servers env-tf-validate
 # In a separate deployment review: make ENV=ubuntu-servers env-tf-plan
 ```
 
-`env-tf-apply` and `env-tf-destroy` are explicit operator actions; no target runs them automatically. `env-tf-destroy` prompts and refers only to this root's state. The default `make tf-*`, `make up`, and `make ansible-site` still refer to the old K3s root. The new root's local state is `environments/ubuntu-servers/terraform.tfstate`, ignored by Git; protect and back it up outside the checkout. Never copy the original workstation's K3s state to this host.
+`env-tf-apply` and `env-tf-destroy` are explicit operator actions; no target runs them automatically. The Phase 2 controller requires a reviewed local `.local-tools.json`, `ENV=ubuntu-servers` on the command line and exact terminal input `apply ubuntu-servers` or `destroy ubuntu-servers`, respectively. This authorization is separate from reviewing the plan; Terraform may ask for its own approval too. Legacy `make tf-*`, `make up`, and `make ansible-site` remain K3s-only and reject an Ubuntu environment selection. The new root's local state is `environments/ubuntu-servers/terraform.tfstate`, ignored by Git; protect and back it up outside the checkout. Never copy the original workstation's K3s state to this host. See the [controller runbook](../../docs/OPERATION-CONTROLLER.md) before operational use.
+
+For a **separately approved** VM snapshot, select exactly one state-owned domain, for example `make ENV=ubuntu-servers VM=ubuntu-server-01 snapshot`. The Phase 2 target checks membership in this root's `vm_names` output and matches `vm_uuids` to `virsh -c qemu:///system domuuid` before requesting `snapshot ubuntu-servers ubuntu-server-01`. It never snapshots all running VMs. The target is intentionally limited to local `qemu:///system`; remote provider URIs require a separately reviewed solution. Account for qcow2/ZFS snapshot growth; this is not a guest-data backup or a disposable test of existing servers.
 
 After the first apply, `make ENV=ubuntu-servers env-state-backup` creates a timestamped local state copy (also ignored by Git); separately keep an off-workstation backup.
 
@@ -58,10 +60,10 @@ make ENV=ubuntu-servers env-ansible-syntax
 unset UBUNTU_SERVERS_OUTPUTS_FILE
 ```
 
-`ansible/playbooks/ubuntu-servers.yaml` ensures qemu-guest-agent stays running; it never calls the K3s site. When changing DHCP assignments, update root inputs and re-run inventory from outputs, not from an independently maintained IP list. Output-driven inventory needs applied state; the offline fixture verifies only script format and playbook parsing.
+In the **uncommitted working tree**, `ansible/playbooks/ubuntu-servers.yaml` calls `ubuntu_baseline` for common OS packages and a running/enabled qemu-guest-agent; the last reported run had `changed=0 failed=0` for both VMs. The playbook never calls the K3s site. When changing DHCP assignments, update root inputs and re-run inventory from outputs, not from an independently maintained IP list. Output-driven inventory needs applied state; the offline fixture verifies only script format and playbook parsing. Review role changes in check mode before any approved execution.
 
 The existing K3s version remains `v1.32.0` in the two K3s inventory group-var files; it is no longer a variable for generic Ubuntu hosts.
 
 ## Remaining deployment gates
 
-Operator verifies the mounted host storage and `base/`, checks its free space and policy, builds/seals/publishes and boots a test copy of the image, checks filesystem permissions and AppArmor policy for the actual paths, chooses collision-free network/bridge/MACs, and confirms provider permissions/ISO upload behavior with a reviewed plan and subsequent smoke test. Neither `terraform validate` nor the checks in this repository confirm that libvirt can boot guests on this ZFS path.
+The operator reports that the published v1 image and two existing guests have passed boot/cloud-init/SSH/guest-agent checks and that a later plan was clean. Before **new** VM creation, verify storage free space, image checksum and AppArmor/access, choose collision-free identities, and review the plan and provider PTY risk described in [engineering continuity](../../docs/ENGINEERING-CONTINUITY.md). Neither `terraform validate` nor the reported clean plan verifies the untested initial-creation console workaround or device drift hidden by `ignore_changes = [devices]`.

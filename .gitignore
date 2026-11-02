@@ -15,6 +15,10 @@ environments/**/*.tfplan
 ansible/inventories/*.outputs.json
 **/__pycache__/
 
+# Reviewed workstation-specific executable paths and per-checkout controller lock
+.local-tools.json
+.local-operations.lock
+
 # Packer output
 packer/output-*/
 packer/seed.iso

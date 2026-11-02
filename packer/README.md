@@ -1,5 +1,7 @@
 # Ubuntu 24.04 image: build, seal, publish
 
+**Current target-host baseline:** the operator reports that `ubuntu-24.04-v1.qcow2` is already published at `/var/lib/libvirt/images/labs/base/` (SHA-256 `4d6565fd43a775899b03730e72daca4669f8c71ce57e31482b5520965aef790d`) and has passed two disposable clone tests. The `v1` publication example below is historical for this host: **do not run it again or overwrite the in-use image**. Use a new version name only after a separately reviewed build and clone test. See [engineering continuity](../docs/ENGINEERING-CONTINUITY.md) for evidence boundaries and ownership.
+
 Packer's QEMU builder (plugin v1.1.7) boots a clone of the pinned Ubuntu cloud qcow2 (`disk_image = true`, without a backing file); there is no installer or keyboard boot command. The attached, host-side NoCloud `seed.iso` sets up the `ubuntu` account and SSH key for provisioning; it is **not** copied into the guest disk. The builder runs provisioning via SSH, runs `seal-image.sh` as its last provisioner and sends an authenticated `shutdown_command` that removes build SSH credentials before `shutdown -P now`. A shutdown timeout is an error, not a reason to silently accept a forced halt. `output_directory` is relative to Packer's working directory; Make always changes into `packer/`. `path.root` supplies the seed and sealing-script paths independently of the caller's working directory.
 
 ## Before the build
@@ -14,7 +16,7 @@ make packer-init
 make packer-fmt-check
 make packer-validate        # regenerates packer/seed.iso; does not boot a VM
 # After reviewing the build separately:
-make packer-build           # regenerates the seed again; boots and seals the build VM
+make packer-build           # Phase 2 controller requires interactive "build ubuntu-servers" before booting
 ```
 
 `base_image_url` and `base_image_checksum` in `variables.pkr.hcl` are used by the builder; Packer verifies the explicit SHA-256. If the upstream `/release/` URL changes, stop and independently verify the new source and checksum before deliberately updating the pinned value; never disable checksum verification. `packer validate` checks configuration, not the remote image contents or whether boot, package installation, shutdown and sealing succeed. Avoid concurrent builds in the same output directory. Never run `packer build -force` against an output directory containing an image you intend to retain.
