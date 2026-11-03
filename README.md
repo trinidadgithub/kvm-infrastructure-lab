@@ -13,10 +13,11 @@ Packer images, Terraform-managed libvirt environments, and Ansible guest configu
 The existing `terraform/` root and unprefixed `make tf-*`, `make up`, and `make ansible-site` commands still manage the original K3s lab. They do not select the new environment. Supply `ENV=k3s-lab` explicitly for legacy operational targets; `ENV=ubuntu-servers` is required for Ubuntu `env-*` operations.
 
 - Generic Ubuntu environment: [environments/ubuntu-servers/README.md](environments/ubuntu-servers/README.md)
+- Prepared, unapplied PTY regression environment: [environments/pty-regression/README.md](environments/pty-regression/README.md) and [read-only preflight](docs/PTY-REGRESSION.md)
 - Current engineering handoff and safety notes: [docs/ENGINEERING-CONTINUITY.md](docs/ENGINEERING-CONTINUITY.md)
 - Historical refactor design: [docs/REPOSITORY-REFACTOR-DESIGN.md](docs/REPOSITORY-REFACTOR-DESIGN.md)
 
-For the new root, select it explicitly: `make ENV=ubuntu-servers env-info`, `make ENV=ubuntu-servers env-tf-init`, `make ENV=ubuntu-servers env-tf-validate`, and (only after host review) `make ENV=ubuntu-servers env-tf-plan`. New `env-*` commands print the Terraform root and local state path before running. Apply, destroy, guest-configuration and snapshot operations require a terminal and an exact scope-specific confirmation; `*-auto` targets are disabled. Neither building nor publishing a Packer image is part of Terraform initialization.
+For the Ubuntu root, select it explicitly: `make ENV=ubuntu-servers env-info`, `make ENV=ubuntu-servers env-tf-init`, `make ENV=ubuntu-servers env-tf-validate`, and (only after host review) `make ENV=ubuntu-servers env-tf-plan`. New `env-*` commands print the Terraform root and local state path before running. Apply, destroy, guest-configuration and snapshot operations require a terminal and an exact scope-specific confirmation; `*-auto` targets are disabled. The PTY regression root has no Make target; its fixed saved-plan controller bootstrap, cleanup and partial recovery require separate approvals. Neither building nor publishing a Packer image is part of Terraform initialization.
 
 ### Shared image commands
 

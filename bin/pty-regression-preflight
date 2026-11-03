@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TF_ROOT="$ROOT/environments/pty-regression"
+URI="qemu:///system"
+
+POOL="pty-regression"
+POOL_PATH="/var/lib/libvirt/images/labs/pty-regression"
+NET="pty-regression-net"
+BRIDGE="virbr3"
+CIDR="192.168.125.0/24"
+VM="pty-regression-01"
+MAC="52:54:00:cc:00:01"
+IP="192.168.125.10"
+BASE="/var/lib/libvirt/images/labs/base/ubuntu-24.04-v1.qcow2"
+SHA="4d6565fd43a775899b03730e72daca4669f8c71ce57e31482b5520965aef790d"
+
+failures=0
+fail() {
+  printf 'FAIL: %s\n' "$*" >&2
+  failures=$((failures + 1))
+}
+ok() {
+  printf 'ok:   %s\n' "$*"
+}
+trim_names() {
+  python3 -c 'import sys; print("\n".join(line.strip() for line in sys.stdin if line.strip()))'
+}
+
+for command in virsh ip sha256sum python3; do
+  command -v "$command" >/dev/null 2>&1 || {
+    printf 'Missing required read-only tool: %s\n' "$command" >&2
+    exit 1
+  }
+done
+
+if ! virsh -c "$URI" list --all >/dev/null 2>&1; then
+  printf 'Cannot read libvirt at %s; refusing to continue.\n' "$URI" >&2
+  exit 1
+fi
+domains="$(virsh -c "$URI" list --all --name | trim_names)" || exit 1
+networks="$(virsh -c "$URI" net-list --all --name | trim_names)" || exit 1
+pools="$(virsh -c "$URI" pool-list --all --name | trim_names)" || exit 1
+
+printf '=== current libvirt inventory ===\n'
+virsh -c "$URI" list --all
+virsh -c "$URI" net-list --all
+virsh -c "$URI" pool-list --all
+printf '\n=== current bridges and routes ===\n'
+ip -br link
+ip -4 route
+
+printf '\n=== proposed disposable identifiers ===\n'
+printf 'pool:    %s (%s)\n' "$POOL" "$POOL_PATH"
+printf 'network: %s on %s (%s), gateway 192.168.125.1\n' "$NET" "$BRIDGE" "$CIDR"
+printf 'VM:      %s, MAC %s, IP %s\n' "$VM" "$MAC" "$IP"
+printf 'image:   %s\n' "$BASE"
+printf 'state:   %s/terraform.tfstate\n\n' "$TF_ROOT"
+
+printf '=== collision checks ===\n'
+
+if [ -e "$TF_ROOT/terraform.tfstate" ] || [ -L "$TF_ROOT/terraform.tfstate" ]; then
+  fail "state already exists at $TF_ROOT/terraform.tfstate; this is not a state-free bootstrap"
+else
+  ok "disposable Terraform state is absent"
+fi
+
+if grep -Fxq "$VM" <<< "$domains"; then
+  fail "domain $VM already exists"
+else
+  ok "domain $VM is absent"
+fi
+
+if grep -Fxq "$NET" <<< "$networks"; then
+  fail "network $NET already exists"
+else
+  ok "network $NET is absent"
+fi
+
+if grep -Fxq "$POOL" <<< "$pools"; then
+  fail "pool $POOL already exists"
+else
+  ok "pool $POOL is absent"
+fi
+
+if ip link show "$BRIDGE" >/dev/null 2>&1; then
+  fail "bridge $BRIDGE already exists"
+else
+  ok "bridge $BRIDGE is absent"
+fi
+
+overlapping_routes="$(ip -j -4 route show table all | python3 -c '
+import ipaddress, json, sys
+target = ipaddress.ip_network("192.168.125.0/24")
+for route in json.load(sys.stdin):
+    destination = route.get("dst", "default")
+    if destination == "default":
+        continue
+    try:
+        network = ipaddress.ip_network(destination, strict=False)
+    except ValueError:
+        continue
+    if network.overlaps(target):
+        print(destination)
+')"
+if [ -n "$overlapping_routes" ]; then
+  fail "host has overlapping route(s): $overlapping_routes"
+else
+  ok "host has no route overlapping $CIDR (excluding default)"
+fi
+
+network_collision=0
+while IFS= read -r network; do
+  [ -n "$network" ] || continue
+  xml="$(virsh -c "$URI" net-dumpxml "$network")" || { fail "cannot inspect network $network"; network_collision=1; continue; }
+  if grep -Fq '192.168.125.' <<< "$xml"; then
+    fail "libvirt network $network already uses 192.168.125.0/24"
+    network_collision=1
+  fi
+  if grep -Fq "<bridge name='$BRIDGE'" <<< "$xml"; then
+    fail "libvirt network $network already claims bridge $BRIDGE"
+    network_collision=1
+  fi
+  if grep -Fq "$MAC" <<< "$xml"; then
+    fail "libvirt network $network already reserves MAC $MAC"
+    network_collision=1
+  fi
+done <<< "$networks"
+if [ "$network_collision" -eq 0 ]; then
+  ok "no libvirt network uses the proposed subnet, bridge or MAC"
+fi
+
+mac_collision=0
+while IFS= read -r domain; do
+  [ -n "$domain" ] || continue
+  xml="$(virsh -c "$URI" dumpxml "$domain")" || { fail "cannot inspect domain $domain"; mac_collision=1; continue; }
+  if grep -Fq "$MAC" <<< "$xml"; then
+    fail "domain $domain already uses MAC $MAC"
+    mac_collision=1
+  fi
+done <<< "$domains"
+if [ "$mac_collision" -eq 0 ]; then
+  ok "no existing libvirt domain uses MAC $MAC"
+fi
+
+pool_path_collision=0
+while IFS= read -r pool; do
+  [ -n "$pool" ] || continue
+  xml="$(virsh -c "$URI" pool-dumpxml "$pool")" || { fail "cannot inspect pool $pool"; pool_path_collision=1; continue; }
+  if grep -Fq "<path>$POOL_PATH</path>" <<< "$xml"; then
+    fail "libvirt pool $pool already claims path $POOL_PATH"
+    pool_path_collision=1
+  fi
+done <<< "$pools"
+if [ "$pool_path_collision" -eq 0 ]; then
+  ok "no existing libvirt pool claims $POOL_PATH"
+fi
+
+if [ -e "$POOL_PATH" ] || [ -L "$POOL_PATH" ]; then
+  fail "pool path already exists: $POOL_PATH"
+else
+  ok "pool path is absent: $POOL_PATH"
+fi
+
+if [ ! -f "$BASE" ]; then
+  fail "published base image is missing: $BASE"
+elif [ ! -r "$BASE" ]; then
+  fail "published base image is not readable: $BASE"
+else
+  actual="$(sha256sum "$BASE" | cut -d' ' -f1)"
+  if [ "$actual" != "$SHA" ]; then
+    fail "base image checksum mismatch: expected $SHA, got $actual"
+  else
+    ok "published v1 image checksum matches"
+  fi
+fi
+
+printf '\n=== persistent-resource presence checks ===\n'
+for domain in ubuntu-server-01 ubuntu-server-02; do
+  if virsh -c "$URI" dominfo "$domain" >/dev/null 2>&1; then
+    ok "persistent domain present: $domain"
+  else
+    fail "expected persistent domain is missing: $domain"
+  fi
+done
+for object in "pool ubuntu-servers" "network ubuntu-servers-net"; do
+  kind="${object%% *}"
+  name="${object#* }"
+  case "$kind" in
+    pool) info_command="pool-info" ;;
+    network) info_command="net-info" ;;
+    *) fail "unsupported persistent object kind: $kind"; continue ;;
+  esac
+  if virsh -c "$URI" "$info_command" "$name" >/dev/null 2>&1; then
+    ok "persistent $kind present: $name"
+  else
+    fail "expected persistent $kind is missing: $name"
+  fi
+done
+
+if grep -Fxq clone-test <<< "$pools"; then
+  if [ -e /var/lib/libvirt/images/labs/clone-test ]; then
+    printf 'note: inactive pool clone-test exists and its target directory is present\n'
+  else
+    printf 'note: inactive pool clone-test exists but its target directory is absent\n'
+  fi
+fi
+
+printf '\n=== result ===\n'
+if [ "$failures" -ne 0 ]; then
+  printf '%s preflight check(s) failed; do not bootstrap.\n' "$failures" >&2
+  exit 1
+fi
+printf 'All preflight checks passed. No resources were created or changed.\n'
+printf 'Next: review environments/pty-regression/README.md and run the state-free plan procedure.\n'

@@ -2,6 +2,7 @@
 
 - **[Engineering continuity](ENGINEERING-CONTINUITY.md)** — authoritative current handoff, ownership, operational evidence, PTY issue, P0 Makefile findings, state recovery and next decisions. Start here.
 - [Operation controller](OPERATION-CONTROLLER.md) — Phase 2 executable manifest, exact approvals, trust limitations and isolated stub tests.
+- [PTY regression preparation](PTY-REGRESSION.md) — read-only preflight, isolated disposable root, saved creation plan, guarded lifecycle/recovery and AppArmor findings.
 - [Ubuntu environment runbook](../environments/ubuntu-servers/README.md) — configuration inputs, target-host preflight and environment-specific operations.
 - [Packer image workflow](../packer/README.md) — build, seal, validate and publish new image versions.
 - [Repository refactor design](REPOSITORY-REFACTOR-DESIGN.md) — historical proposal, including work that has since been implemented or superseded.

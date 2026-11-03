@@ -1,0 +1,10 @@
+# Copy to terraform.tfvars on the target workstation after reviewing host paths.
+# The VM identity, network, bridge, pool and image version are intentionally fixed
+# by variable validation in this disposable regression root.
+
+pool_group_id = "64055" # replace with the local `getent group libvirt-qemu` GID
+
+base_image        = "/var/lib/libvirt/images/labs/base/ubuntu-24.04-v1.qcow2"
+base_image_sha256 = "4d6565fd43a775899b03730e72daca4669f8c71ce57e31482b5520965aef790d"
+
+ssh_public_key_path = "/home/USER/.ssh/id_ed25519.pub"
