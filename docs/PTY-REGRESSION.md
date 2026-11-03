@@ -1,6 +1,6 @@
-# PTY regression environment: preflight and prepared plan
+# PTY regression environment: initial creation validated
 
-**Status:** prepared, **not applied**. No VM, pool, network, bridge, state or AppArmor change was made. This document records a read-only assessment plus a saved creation-only Terraform plan for review.
+**Status:** the one-time, explicitly approved bootstrap succeeded on 2026-11-03. `pty-regression-01` is **running** and its independent Terraform state owns six resources. **Leave the VM running; cleanup, recovery and restart are not authorized.** The pre-bootstrap inventory and approved plan below are historical evidence, not permission to recreate the environment.
 
 **Date:** 2026-11-03
 
@@ -21,6 +21,25 @@ The test environment is intentionally disposable and isolated from:
 - the published image
 - the existing `clone-test` pool
 - AppArmor policy
+
+## Completed initial experiment — independently verified
+
+| Evidence | Result |
+| --- | --- |
+| Configuration checkpoint | `b99f0255c8ce52017dd7843f57b328499afa0e06` |
+| Toolchain | Terraform **1.11.2**, locked `dmacvicar/libvirt` **0.9.9**, provider URI `qemu:///system` |
+| Approved saved creation plan | SHA-256 `3842aab121e013eddb983dd2c10a5f87e19d56313013e27dd5ee402080aa9bcb`; six creates, zero changes/destroys |
+| Controller bootstrap | Exact digest-bearing approval was supplied to `bin/operate bootstrap pty-regression`; Terraform exited **0**, **6 added, 0 changed, 0 destroyed**; **no provider inconsistency** |
+| State and identity | Exactly six expected addresses in `environments/pty-regression/terraform.tfstate`, **no Terraform-tainted instances**; pool/network/domain UUIDs match local libvirt; VM UUID `e33929f5-fe83-477f-9d0d-504ac4ef0836` |
+| Serial/agent devices | Terraform state has `consoles = []`; live domain XML has **zero serial and zero console devices**. `org.qemu.guest_agent.0` channel is connected and `guest-ping` responded |
+| AppArmor | Generated `libvirt-e33929f5-fe83-477f-9d0d-504ac4ef0836` profile is **enforcing**; overlay `rwk`, v1 backing image `rk`, cloud-init ISO `rk` |
+| Storage and image | Read-only `qemu-img info -U --backing-chain` showed the disposable 20 GiB qcow2 overlay backed by `/var/lib/libvirt/images/labs/base/ubuntu-24.04-v1.qcow2`; image SHA-256 remains `4d6565fd43a775899b03730e72daca4669f8c71ce57e31482b5520965aef790d` |
+| Guest and reconciliation | VM running at reserved `192.168.125.10`; SSH works, hostname correct, cloud-init **done** with `errors: []`, guest agent active, guest clock NTP-synchronized; fresh Terraform plan returned detailed exit **0, no changes** |
+| Persistent Ubuntu servers | `ubuntu-server-01` UUID `034de61a-fed6-40bf-8c82-cbeb923255d4` and `ubuntu-server-02` UUID `5f4d96cb-b655-4b6f-83e4-877b3fdcef18` remained unchanged |
+
+**Separate diagnostic observations:** cloud-init records `last_update: Thu, 01 Jan 1970 00:00:32 +0000` although the guest's current UTC clock is correct and `NTPSynchronized=yes`. After the explicit read-only `guest-ping`, libvirt `dominfo` reports **`tainted: custom guest agent control commands issued`**. That is a **libvirt domain diagnostic**, not Terraform resource taint: the Terraform state has no tainted instances and the subsequent plan is no-change. Neither observation is a Terraform provider inconsistency.
+
+The local, mode-`0600` evidence logs are `/tmp/opencode/pty-regression-bootstrap-20261103T160143Z-3511188.log` and `/tmp/opencode/pty-regression-reconciliation-20261103T160715Z-3514579.log`. These paths reference host-local evidence only; log contents, state, private tfvars, SSH material and saved plans are **not** committed.
 
 ## 2. `clone-test` pool investigation
 
@@ -68,11 +87,11 @@ This is the mechanism that permits `/var/lib/libvirt/images/labs/…` access. It
 - That file is not installed at `/etc/apparmor.d/local/abstractions/libvirt-qemu` on this host.
 - The effective access comes from libvirt's dynamically generated per-domain profile and its `.files` fragment.
 
-### Expected impact on fresh creation
+### Verified impact on fresh creation
 
-Fresh creation is **likely** to work without additional AppArmor policy because libvirt should generate a new profile for the new domain UUID containing the new overlay, base-image and ISO paths. This cannot be proven without an approved creation.
+The approved creation **did** generate an enforcing profile for `pty-regression-01` without changing AppArmor policy. Its generated `.files` fragment grants the new overlay `rwk`, the v1 backing image `rk` and the pool-owned ISO `rk`. The QEMU process reported the matching profile in enforce mode.
 
-After an approved creation, verify:
+For later read-only rechecks, inspect:
 
 ```sh
 ls -la /etc/apparmor.d/libvirt/libvirt-<new-uuid>*
@@ -85,7 +104,7 @@ Do not modify or disable AppArmor. If the new profile is missing or denied paths
 
 Evidence limitation: unprivileged `aa-status` was denied, so this assessment used the readable generated profile files and `/proc/<pid>/attr/current`, not a privileged AppArmor status dump.
 
-## 4. Existing libvirt and host inventory
+## 4. Pre-bootstrap libvirt and host inventory (historical snapshot)
 
 ### Domains
 
@@ -128,14 +147,14 @@ Host routes include:
 192.168.124.0/24
 ```
 
-There is no host route for `192.168.125.0/24`.
+There was no host route for `192.168.125.0/24` **before bootstrap**; the approved network now uses that subnet on `virbr3`.
 
 ## 5. Selected collision-free identifiers
 
 | Item | Selected value |
 | --- | --- |
 | Terraform root | `environments/pty-regression/` |
-| State | `environments/pty-regression/terraform.tfstate` (absent) |
+| State | `environments/pty-regression/terraform.tfstate` (absent before bootstrap; now owns six resources) |
 | Pool | `pty-regression` |
 | Pool path | `/var/lib/libvirt/images/labs/pty-regression` |
 | Network | `pty-regression-net` |
@@ -149,7 +168,7 @@ There is no host route for `192.168.125.0/24`.
 | Base image | `/var/lib/libvirt/images/labs/base/ubuntu-24.04-v1.qcow2` |
 | Expected SHA-256 | `4d6565fd43a775899b03730e72daca4669f8c71ce57e31482b5520965aef790d` |
 
-`bin/pty-regression-preflight` confirmed:
+Immediately before bootstrap, `bin/pty-regression-preflight` confirmed:
 
 - state absent
 - domain, network, pool and bridge absent
@@ -159,9 +178,9 @@ There is no host route for `192.168.125.0/24`.
 - v1 image checksum matches
 - persistent Ubuntu domains, pool and network are present
 
-## 6. Proposed Terraform resources
+## 6. Approved creation plan and resources
 
-The saved plan contains exactly six creates:
+The approved saved plan contained exactly six creates; all six were created through the controller:
 
 | Address | Action | Purpose |
 | --- | --- | --- |
@@ -202,7 +221,7 @@ It is Git-ignored. Review it with:
 terraform -chdir=environments/pty-regression show -no-color pty-regression.tfplan
 ```
 
-At checkpoint review, the regenerated saved plan's SHA-256 was `3842aab121e013eddb983dd2c10a5f87e19d56313013e27dd5ee402080aa9bcb`. This identifies the reviewed local artifact, not an authorization to apply; regenerate and re-review it if any input changes.
+At checkpoint review and immediately before bootstrap, the saved plan's SHA-256 was `3842aab121e013eddb983dd2c10a5f87e19d56313013e27dd5ee402080aa9bcb`. It is retained as historical evidence, **not** authorization to apply it again.
 
 ## 7. Safety design
 
@@ -217,12 +236,12 @@ At checkpoint review, the regenerated saved plan's SHA-256 was `3842aab121e013ed
 - Normal cleanup requires existing state, exactly six state-owned deletes, matching live domain/pool/network UUIDs and no extra pool volumes or dependent domains. Partial recovery is a separate operation limited to a state-owned subset **without a live disposable VM**.
 - Each operation inspects and executes the **same sealed in-memory plan bytes**; the exact interactive token includes their SHA-256. A changed pathname after review cannot substitute other bytes. The canonical-tool manifest, restricted environment and per-checkout lock still apply. Direct Terraform/libvirt invocations and a different checkout are outside this operational control; host routes and unmanaged directory collisions still require the separate read-only preflight.
 
-## 8. Bootstrap procedure
+## 8. Completed bootstrap procedure (historical; do not rerun)
 
-This is a **state-free, one-time, controller-gated** procedure. It requires separate operator approval before the apply step.
+This **state-free, one-time, controller-gated** procedure was completed with separate operator approval. The following steps record what was reviewed and executed; the VM and state now exist, so **do not rerun bootstrap**.
 
-1. Run `bin/pty-regression-preflight`.
-2. Initialize and validate local provider metadata:
+1. `bin/pty-regression-preflight` passed before creation.
+2. Local provider metadata was initialized and configuration validated:
 
    ```sh
    terraform -chdir=environments/pty-regression init -backend=false -input=false
@@ -230,7 +249,7 @@ This is a **state-free, one-time, controller-gated** procedure. It requires sepa
    terraform -chdir=environments/pty-regression fmt -check -recursive
    ```
 
-3. Recreate or inspect the saved creation plan:
+3. The saved creation plan was generated and reviewed:
 
    ```sh
    terraform -chdir=environments/pty-regression plan -input=false \
@@ -238,24 +257,24 @@ This is a **state-free, one-time, controller-gated** procedure. It requires sepa
    terraform -chdir=environments/pty-regression show -no-color pty-regression.tfplan
    ```
 
-4. Confirm the plan is exactly six creates and contains no persistent resources.
-5. The operator must create and review `.local-tools.json` as described in [the controller runbook](OPERATION-CONTROLLER.md). It is currently absent. After it exists, `/usr/bin/python3 -I bin/operate validate-tools pty-regression` checks canonical paths without running tools.
-6. **Stop and obtain explicit approval.** Do not apply during preparation.
-7. Immediately before an approved bootstrap, repeat `bin/pty-regression-preflight`, inspect the saved plan again, then invoke:
+4. The plan contained exactly six creates and no persistent resources.
+5. The operator-approved, Git-ignored `.local-tools.json` was created with mode `0600`; `/usr/bin/python3 -I bin/operate validate-tools pty-regression` passed using the reviewed canonical paths.
+6. **Explicit operator approval** was obtained for the plan and its SHA-256.
+7. Immediately before the approved bootstrap, the read-only preflight and plan digest were rechecked; the controller was invoked once:
 
    ```sh
    /usr/bin/python3 -I bin/operate bootstrap pty-regression
    ```
 
-   Compare `sha256sum environments/pty-regression/pty-regression.tfplan` with the reviewed digest. The controller requires the exact terminal token `bootstrap pty-regression <64-character-plan-SHA-256>`, verifies the saved plan and then applies the sealed bytes it inspected. A changed plan requires renewed review and approval.
+   The controller accepted the exact token `bootstrap pty-regression <64-character-plan-SHA-256>` and applied the same sealed bytes it inspected. It returned success with six creates and no provider inconsistency.
 
-8. Record the apply result, state/taint status, domain XML, AppArmor profile, guest/cloud-init/SSH/guest-agent health, and a refreshed plan.
+8. The apply result, state/taint status, domain XML, AppArmor profile, guest/cloud-init/SSH/guest-agent health and refreshed plan were recorded above.
 
-A successful boot alone is not a pass. The test passes only if initial creation is clean, the domain is not tainted, and a subsequent plan reconciles without a PTY inconsistency.
+The initial-creation test passed: clean creation, no Terraform-tainted resource and a subsequent no-change plan, corroborated by guest and live XML checks. This does not establish restart persistence or a working explicit PTY serial console.
 
 ## 9. Cleanup procedure
 
-Cleanup is separately destructive and requires separate approval.
+Cleanup is **not authorized**. Keep `pty-regression-01` running. The following is a procedure for a later, separately reviewed decision; no destroy plan or cleanup operation was run during the initial experiment.
 If creation partially succeeds, state is tainted or the destroy plan is not exactly six in-scope deletes, stop for state/domain inspection and a new recovery review; do not bypass the cleanup guard.
 
 ```sh
@@ -276,6 +295,8 @@ Verify the disposable resources are gone, the local state is empty, and the pers
 
 ## 10. Partial-creation recovery when no VM exists
 
+**Not applicable to the current healthy, running VM and complete six-resource state.** This is a contingency procedure only; recovery is not authorized.
+
 If domain creation fails after pool/network/storage creation, **stop**. An apply failure can leave a valid partial state and live disposable resources; a failed VM need not have a UUID. Do not repeat bootstrap, use normal cleanup, untaint, remove state addresses or directly undefine resources to suppress the error.
 
 1. Freeze writers and preserve the failed apply output, local state, plan and disks. Read **only** the disposable root's addresses with `terraform -chdir=environments/pty-regression state list`; inspect taint/status privately without printing state or keys into shared logs. Compare `virsh -c qemu:///system list --all`, `pool-dumpxml pty-regression`, `net-dumpxml pty-regression-net`, and `vol-list --pool pty-regression` to state ownership. Verify that `pty-regression-01` is truly absent, that pool/network UUIDs match state, no other domain uses their network/storage, and the published image checksum remains unchanged.
@@ -294,24 +315,17 @@ If domain creation fails after pool/network/storage creation, **stop**. An apply
 
 This partial recovery was exercised **only with isolated stubs**, not on the host.
 
-## 11. Concise operator checklist
+## 11. Operator checklist after initial creation
 
-1. Create Git-ignored `.local-tools.json` from `docs/local-tools.example.json`; inspect absolute paths, executable ownership, tfenv's canonical target and versions. Run `/usr/bin/python3 -I bin/operate validate-tools pty-regression` and compare its output to reviewed paths.
-2. Re-run `bin/pty-regression-preflight`; confirm absent state/conflicts, correct `qemu:///system`, host routes/bridge/pool path, and `sha256sum /var/lib/libvirt/images/labs/base/ubuntu-24.04-v1.qcow2` equals `4d6565fd43a775899b03730e72daca4669f8c71ce57e31482b5520965aef790d`.
-3. Review `terraform -chdir=environments/pty-regression show -no-color pty-regression.tfplan`: exactly six creates, zero changes/deletes, `consoles = []`, guest-agent channel, fixed identities and backing path. Verify `sha256sum environments/pty-regression/pty-regression.tfplan` against the reviewed digest. Regenerate/re-review if inputs or the plan changed.
-4. Obtain explicit **creation** approval for that plan and its digest; only then use the controller's `bootstrap` operation and enter its full digest-bearing token.
-5. Inspect apply result, state/taint, domain UUID/XML, generated AppArmor profile, overlay backing chain, guest/cloud-init/SSH/agent health and published-image checksum. A running guest alone is not success.
-6. Review a fresh subsequent plan for **no changes** and compare live device XML because `ignore_changes = [devices]` may conceal drift. Stop on taint or partial failure and use §10.
-7. For normal cleanup, make a protected state/overlay backup, review the independent six-delete `pty-regression-destroy.tfplan`, verify its checksum and obtain separate **cleanup** approval. Use the controller's `cleanup` operation with its full digest-bearing token; partial state requires §10 instead.
-8. Confirm the disposable domain, network, bridge, pool/volumes and state are gone; recheck both persistent Ubuntu resources and the unchanged v1 checksum. Retain evidence until recovery is verified.
+1. **Completed:** reviewed and validated Git-ignored `.local-tools.json`, image/creation-plan checksums, six-create plan and explicit bootstrap approval.
+2. **Completed:** state and UUID ownership, no Terraform taint, XML/agent/AppArmor/backing-chain checks, SSH/cloud-init/guest time, unchanged v1 hash and a fresh **no-change** plan. Compare live XML as well as plans because `ignore_changes = [devices]` can conceal drift.
+3. **Pending separate approval:** any shutdown/restart or guest configuration. Keep the VM running; do not run Ansible.
+4. **Pending separate approval:** protected state/overlay backup, independent six-delete cleanup plan and checksum review, controller cleanup, then confirmation that all disposable resources are gone and persistent resources unchanged. Partial recovery requires its own approval and §10 instead.
 
 ## 12. Remaining blockers and open questions
 
-1. **Explicit approval is required** before any apply, VM creation, restart or cleanup.
-2. **PTY behavior on initial creation is still unverified.** The saved plan correctly shows `consoles = []`, but libvirt may add a default console and the provider readback behavior is the subject of the test.
-3. **AppArmor profile generation is unverified until creation.** Current evidence suggests dynamic profiles will include the new paths, but this must be checked after an approved apply.
-4. **No `.local-tools.json` exists.** The controller fails closed until the operator supplies and reviews the workstation manifest. The PTY mapping is limited to bootstrap/cleanup/recover; `configure` cannot target the persistent Ubuntu inventory.
-5. **`clone-test` remains unresolved.** It is not part of this root and must not be deleted or activated without operator direction.
-6. **No off-host state/overlay backup exists for this new root yet.** After creation, capture the new state and record overlay/ISO paths before any further experiment.
-7. The saved plan must be regenerated if any configuration, provider lock or input changes before approval.
-8. Applying a sealed memfd with the real Terraform CLI has **not** been exercised; real `terraform show -json` accepted the sealed creation plan read-only, and apply behavior is covered only by stub tests.
+1. **Keep the VM running.** Cleanup, recovery, restart and guest configuration are not authorized.
+2. Initial creation and reconciliation validated `consoles = []` for this disposable VM, **not** a useful PTY-backed serial console. `ignore_changes = [devices]` can still conceal later device drift.
+3. **`clone-test` remains unresolved.** It is not part of this root and must not be deleted or activated without operator direction.
+4. **Off-host state/overlay backup and restore remain untested.** Protect the new local state, overlay and retained v1 backing image; separately approve a backup before any future cleanup.
+5. No restart/lifecycle persistence test, alternative console variant, Ansible play or cleanup has been performed on this VM.
