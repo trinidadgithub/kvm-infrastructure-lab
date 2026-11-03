@@ -1,5 +1,7 @@
 # Lab Plan
 
+> Historical K3s host notes; for current ownership and Makefile controls see [Engineering continuity](ENGINEERING-CONTINUITY.md). The older destroy targets' claimed prompt guard was **not effective** because Make ran later recipe lines in separate shells. Phase 2 replaced that behavior with a fixed-mapping operation controller. Do not follow this older `make up` rebuild procedure.
+
 ## Active VMs
 - jumpbox — management/bastion host (192.168.123.10)
 - k3s-master — k3s server (192.168.123.11)

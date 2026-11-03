@@ -4,6 +4,21 @@ terraform/terraform.tfstate
 terraform/terraform.tfstate.backup
 terraform/terraform.tfstate.*.backup
 
+# Independent Terraform roots (examples and lock files remain tracked)
+environments/**/.terraform/
+environments/**/terraform.tfstate*
+environments/**/*.tfvars
+!environments/**/*.tfvars.example
+environments/**/*.tfplan
+
+# Generated inventory exports (example remains tracked)
+ansible/inventories/*.outputs.json
+**/__pycache__/
+
+# Reviewed workstation-specific executable paths and per-checkout controller lock
+.local-tools.json
+.local-operations.lock
+
 # Packer output
 packer/output-*/
 packer/seed.iso
@@ -29,4 +44,3 @@ bin/npx
 # Tool session artifacts
 opencode-session.txt
 *.opencode-session.txt
-terraform/terraform.tfstate

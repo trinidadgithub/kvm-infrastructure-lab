@@ -1,6 +1,6 @@
 variable "ssh_private_key" {
-  type    = string
-  default = "~/.ssh/id_ed25519"
+  description = "Absolute path to an unencrypted build SSH private key; set PKR_VAR_ssh_private_key. The seed public key is derived from this same key."
+  type        = string
 }
 
 variable "base_image_url" {

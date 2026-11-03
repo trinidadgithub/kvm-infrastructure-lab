@@ -21,6 +21,19 @@ resource "libvirt_cloudinit_disk" "commoninit" {
   meta_data = var.cloudinit_data[each.key].meta_data
 }
 
+resource "libvirt_volume" "cloudinit_iso" {
+  for_each = var.cloudinit_in_pool ? var.vms : {}
+
+  name = "${each.key}-cloudinit.iso"
+  pool = var.pool_name
+  target = {
+    format = { type = "raw" }
+  }
+  create = {
+    content = { url = libvirt_cloudinit_disk.commoninit[each.key].path }
+  }
+}
+
 resource "libvirt_domain" "vm" {
   for_each = var.vms
 
@@ -42,6 +55,20 @@ resource "libvirt_domain" "vm" {
   }
 
   devices = {
+    channels = var.enable_guest_agent ? [
+      {
+        source = {
+          unix = {
+            mode = "bind"
+          }
+        }
+        target = {
+          virt_io = {
+            name = "org.qemu.guest_agent.0"
+          }
+        }
+      }
+    ] : []
     disks = [
       {
         source = {
@@ -56,7 +83,7 @@ resource "libvirt_domain" "vm" {
         device = "cdrom"
         source = {
           file = {
-            file = libvirt_cloudinit_disk.commoninit[each.key].path
+            file = var.cloudinit_in_pool ? libvirt_volume.cloudinit_iso[each.key].path : libvirt_cloudinit_disk.commoninit[each.key].path
           }
         }
         target = { dev = "sda", bus = "sata" }
@@ -75,11 +102,18 @@ resource "libvirt_domain" "vm" {
         model = { type = "virtio" }
       },
     ]
-    consoles = [
+    consoles = var.enable_serial_console ? [
       {
-        source = { pty = { path = "" } }
-        target = { type = "serial", port = 0 }
+        source = {
+          pty = {
+            path = ""
+          }
+        }
+        target = {
+          type = "serial"
+          port = 0
+        }
       },
-    ]
+    ] : []
   }
 }

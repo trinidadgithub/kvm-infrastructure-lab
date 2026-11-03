@@ -1,0 +1,22 @@
+{
+  "executables": {
+    "terraform": {
+      "path": "/home/USER/.tfenv/bin/terraform",
+      "resolved": "/home/USER/.tfenv/versions/VERSION/terraform"
+    },
+    "virsh": {
+      "path": "/usr/bin/virsh",
+      "resolved": "/usr/bin/virsh"
+    },
+    "ansible_playbook": {
+      "path": "/usr/bin/ansible-playbook",
+      "resolved": "/usr/bin/ansible-playbook"
+    },
+    "packer": {
+      "path": "/usr/bin/packer",
+      "resolved": "/usr/bin/packer"
+    }
+  },
+  "k3s_tmpdir": "/var/lib/libvirt/images/lab/cloudinit",
+  "k3s_ssh_public_key": "/home/USER/.ssh/id_ed25519.pub"
+}

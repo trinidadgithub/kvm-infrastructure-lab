@@ -1,0 +1,629 @@
+#!/usr/bin/python3
+"""Fail-closed controller for this repository's named infrastructure operations."""
+
+import fcntl
+import hashlib
+import ipaddress
+import json
+import os
+import pwd
+import re
+import shlex
+import stat
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+CONFIG = ROOT / ".local-tools.json"
+ENVIRONMENTS = {
+    "k3s-lab": ROOT / "terraform",
+    "ubuntu-servers": ROOT / "environments" / "ubuntu-servers",
+    "pty-regression": ROOT / "environments" / "pty-regression",
+}
+OPERATIONS = {"apply", "destroy", "configure", "snapshot", "build", "up", "bootstrap", "cleanup", "recover"}
+ALLOWED_OPERATIONS = {
+    "k3s-lab": {"apply", "destroy", "configure", "snapshot", "up"},
+    "ubuntu-servers": {"apply", "destroy", "configure", "snapshot", "build"},
+    "pty-regression": {"bootstrap", "cleanup", "recover"},
+}
+SYSTEM_URI = "qemu:///system"
+PTY_VM = "pty-regression-01"
+PTY_POOL = "pty-regression"
+PTY_POOL_PATH = "/var/lib/libvirt/images/labs/pty-regression"
+PTY_NETWORK = "pty-regression-net"
+PTY_BRIDGE = "virbr3"
+PTY_SUBNET = ipaddress.ip_network("192.168.125.0/24")
+PTY_BASE = "/var/lib/libvirt/images/labs/base/ubuntu-24.04-v1.qcow2"
+PTY_SHA256 = "4d6565fd43a775899b03730e72daca4669f8c71ce57e31482b5520965aef790d"
+PTY_ADDRESSES = {
+    "libvirt_pool.pty_regression",
+    "libvirt_network.pty_regression",
+    f'module.compute.libvirt_volume.vm_disk["{PTY_VM}"]',
+    f'module.compute.libvirt_cloudinit_disk.commoninit["{PTY_VM}"]',
+    f'module.compute.libvirt_volume.cloudinit_iso["{PTY_VM}"]',
+    f'module.compute.libvirt_domain.vm["{PTY_VM}"]',
+}
+PTY_DOMAIN_ADDRESS = f'module.compute.libvirt_domain.vm["{PTY_VM}"]'
+
+
+class Refused(Exception):
+    """A request did not pass preflight or approval."""
+
+
+class ChildFailed(Exception):
+    """A selected tool ran but returned a failure status."""
+
+    def __init__(self, status):
+        self.status = status
+
+
+def tool(config, name):
+    entries = config.get("executables")
+    if not isinstance(entries, dict):
+        raise Refused(f"Configure executables in {CONFIG}")
+    entry = entries.get(name)
+    if not isinstance(entry, dict):
+        raise Refused(f"Missing executable {name} in {CONFIG}")
+    path, expected = entry.get("path"), entry.get("resolved")
+    if not isinstance(path, str) or not isinstance(expected, str):
+        raise Refused(f"Configure absolute path and resolved path for {name}")
+    if not Path(path).is_absolute() or not Path(expected).is_absolute():
+        raise Refused(f"Executable paths for {name} must be absolute")
+    try:
+        actual = Path(path).resolve(strict=True)
+    except OSError as exc:
+        raise Refused(f"Cannot resolve {name}: {exc}") from exc
+    if str(actual) != expected or not actual.is_file() or not os.access(actual, os.X_OK):
+        raise Refused(f"{name} changed or is not executable: expected {expected}, got {actual}")
+    return str(actual)
+
+
+def child_environment(config, operation, environment):
+    user = pwd.getpwuid(os.getuid())
+    result = {
+        "HOME": user.pw_dir,
+        "USER": user.pw_name,
+        "LOGNAME": user.pw_name,
+        "PATH": "/usr/bin:/bin",
+        "LANG": "C.UTF-8",
+    }
+    for name in ("TERM", "SSH_AUTH_SOCK"):
+        if name in os.environ:
+            result[name] = os.environ[name]
+    if operation in ("build",):
+        key = os.environ.get("PKR_VAR_ssh_private_key", "")
+        if not Path(key).is_absolute() or not Path(key).is_file():
+            raise Refused("Set PKR_VAR_ssh_private_key to an existing absolute build key")
+        result["PKR_VAR_ssh_private_key"] = key
+    if environment == "k3s-lab" and operation in ("apply", "destroy", "up"):
+        temp = config.get("k3s_tmpdir")
+        if not isinstance(temp, str) or not Path(temp).is_absolute():
+            raise Refused("Configure an absolute k3s_tmpdir in .local-tools.json")
+        result["TMPDIR"] = temp
+    if operation == "configure" or operation == "up":
+        result["ANSIBLE_ROLES_PATH"] = str(ROOT / "ansible" / "roles")
+    return result
+
+
+def run(command, *, cwd, env, pass_fds=()):
+    print(f"Executing: {shlex.join(command)} (cwd={cwd})", flush=True)
+    completed = subprocess.run(command, cwd=cwd, env=env, pass_fds=pass_fds, check=False)
+    status = completed.returncode if completed.returncode >= 0 else 128 - completed.returncode
+    print(f"Result: {shlex.join(command)} exited {status}", flush=True)
+    if status:
+        raise ChildFailed(status)
+
+
+def confirm(token, description):
+    if not sys.stdin.isatty():
+        raise Refused("Approval requires an interactive terminal")
+    print(f"Target: {description}", file=sys.stderr)
+    print(f'Type exactly "{token}" to authorize: ', end="", file=sys.stderr, flush=True)
+    try:
+        response = input()
+    except EOFError as exc:
+        raise Refused("No approval received (EOF)") from exc
+    if response != token:
+        raise Refused("Approval refused or invalid")
+
+
+def snapshot_vm(name, terraform, virsh, root, env):
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", name):
+        raise Refused("Specify a single valid VM name")
+
+    def output(key):
+        command = [terraform, f"-chdir={root}", "output", "-json", key]
+        data = subprocess.run(command, cwd=ROOT, env=env, capture_output=True, text=True, check=False)
+        if data.returncode:
+            raise Refused(f"Cannot read {key} from {root}: exit {data.returncode}")
+        try:
+            return json.loads(data.stdout)
+        except json.JSONDecodeError as exc:
+            raise Refused(f"Invalid Terraform output {key}") from exc
+
+    names = output("vm_names")
+    if not isinstance(names, list) or name not in names:
+        raise Refused(f"{name} is not owned by {root}")
+    uuids = output("vm_uuids")
+    if not isinstance(uuids, dict):
+        raise Refused(f"Invalid VM UUID output from {root}")
+    expected = uuids.get(name)
+    actual = subprocess.run([virsh, "-c", SYSTEM_URI, "domuuid", name],
+                            env=env, capture_output=True, text=True, check=False)
+    if not expected or actual.returncode or actual.stdout.strip() != expected:
+        raise Refused(f"Domain UUID for {name} does not match {root}")
+    return expected
+
+
+def field(value, *keys):
+    for key in keys:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value
+
+
+def pty_state_guard(root, operation):
+    state = root / "terraform.tfstate"
+    backend_metadata = root / ".terraform" / "terraform.tfstate"
+    if backend_metadata.exists() or backend_metadata.is_symlink():
+        raise Refused("PTY root has backend metadata; review the backend before any operation")
+    if operation == "bootstrap":
+        # A backup, lock or alternate workspace is evidence of a previous writer.
+        if list(root.glob("terraform.tfstate*")):
+            raise Refused("PTY bootstrap found existing state artifacts; inspect them before any action")
+    elif not state.is_file() or state.is_symlink():
+        raise Refused("PTY cleanup requires an existing regular local state file")
+
+
+def read_saved_plan(plan):
+    try:
+        descriptor = os.open(plan, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as exc:
+        raise Refused(f"Cannot open regular saved plan {plan}: {exc}") from exc
+    with os.fdopen(descriptor, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise Refused(f"Saved plan is not a regular file: {plan}")
+        contents = handle.read(64 * 1024 * 1024 + 1)
+    if not contents or len(contents) > 64 * 1024 * 1024:
+        raise Refused("Saved plan is empty or exceeds the 64 MiB review limit")
+    return contents
+
+
+@contextmanager
+def sealed_pty_plan(plan):
+    """Freeze the reviewed bytes in a sealed Linux memfd for both show and apply."""
+    contents = read_saved_plan(plan)
+    digest = hashlib.sha256(contents).hexdigest()
+    descriptor = os.memfd_create("pty-regression-plan", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+    try:
+        with os.fdopen(os.dup(descriptor), "wb") as handle:
+            handle.write(contents)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        fcntl.fcntl(descriptor, fcntl.F_ADD_SEALS,
+                    fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
+        yield descriptor, digest
+    finally:
+        os.close(descriptor)
+
+
+def virsh_read(virsh, env, *arguments):
+    result = subprocess.run([virsh, "-c", SYSTEM_URI, *arguments], cwd=ROOT, env=env,
+                            capture_output=True, text=True, check=False)
+    if result.returncode:
+        raise Refused(f"Cannot inspect local libvirt {' '.join(arguments)}: exit {result.returncode}")
+    return result.stdout
+
+
+def pty_bootstrap_collisions(virsh, env):
+    """Fail closed on conflicts in local libvirt; host routes remain a separate preflight."""
+    domains = {name.strip() for name in virsh_read(virsh, env, "list", "--all", "--name").splitlines()
+               if name.strip()}
+    networks = {name.strip() for name in virsh_read(virsh, env, "net-list", "--all", "--name").splitlines()
+                if name.strip()}
+    pools = {name.strip() for name in virsh_read(virsh, env, "pool-list", "--all", "--name").splitlines()
+             if name.strip()}
+    if PTY_VM in domains or PTY_NETWORK in networks or PTY_POOL in pools:
+        raise Refused("Disposable domain, network or pool already exists")
+    if not {"ubuntu-server-01", "ubuntu-server-02"} <= domains or \
+            "ubuntu-servers-net" not in networks or "ubuntu-servers" not in pools:
+        raise Refused("Expected persistent Ubuntu resources are missing on this libvirt host")
+    for name in domains:
+        try:
+            xml = ET.fromstring(virsh_read(virsh, env, "dumpxml", name))
+        except ET.ParseError as exc:
+            raise Refused(f"Cannot parse domain XML for {name}") from exc
+        if any(mac.get("address", "").lower() == "52:54:00:cc:00:01"
+               for mac in xml.findall("./devices/interface/mac")):
+            raise Refused(f"Disposable MAC already belongs to domain {name}")
+    for name in networks:
+        try:
+            xml = ET.fromstring(virsh_read(virsh, env, "net-dumpxml", name))
+        except ET.ParseError as exc:
+            raise Refused(f"Cannot parse network XML for {name}") from exc
+        bridge = xml.find("bridge")
+        if bridge is not None and bridge.get("name") == PTY_BRIDGE:
+            raise Refused(f"Disposable bridge is already claimed by network {name}")
+        for address in xml.findall("./ip"):
+            try:
+                network = ipaddress.ip_network(
+                    f"{address.get('address')}/{address.get('netmask') or address.get('prefix')}",
+                    strict=False)
+            except ValueError as exc:
+                raise Refused(f"Cannot assess subnet of network {name}") from exc
+            if network.version == 4 and network.overlaps(PTY_SUBNET):
+                raise Refused(f"Disposable subnet overlaps network {name}")
+        if any(host.get("mac", "").lower() == "52:54:00:cc:00:01"
+               for host in xml.findall("./ip/dhcp/host")):
+            raise Refused(f"Disposable MAC is reserved on network {name}")
+    for name in pools:
+        try:
+            xml = ET.fromstring(virsh_read(virsh, env, "pool-dumpxml", name))
+        except ET.ParseError as exc:
+            raise Refused(f"Cannot parse pool XML for {name}") from exc
+        if xml.findtext("./target/path") == PTY_POOL_PATH:
+            raise Refused(f"Disposable path is already claimed by pool {name}")
+
+
+def pty_state_addresses(terraform, root, env):
+    result = subprocess.run([terraform, f"-chdir={root}", "state", "list"], cwd=ROOT, env=env,
+                            capture_output=True, text=True, check=False)
+    if result.returncode:
+        raise Refused("Cannot list the current disposable Terraform state")
+    addresses = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(set(addresses)) != len(addresses):
+        raise Refused("Disposable Terraform state has duplicate addresses")
+    return set(addresses)
+
+
+def pty_recovery_state(terraform, virsh, root, env, addresses):
+    """Recover only the complete state-owned subset, with no live VM to protect."""
+    if pty_state_addresses(terraform, root, env) != addresses:
+        raise Refused("Partial recovery plan does not match the current disposable state addresses")
+    domains = {name.strip() for name in virsh_read(virsh, env, "list", "--all", "--name").splitlines()}
+    if PTY_VM in domains:
+        raise Refused("Disposable VM exists; partial recovery without UUID verification is forbidden")
+
+
+def pty_live_ownership(virsh, env, values):
+    """Reject replaced pool/network objects and unowned volumes before deletion."""
+    pool = values.get("libvirt_pool.pty_regression")
+    network = values.get("libvirt_network.pty_regression")
+    domains = {name.strip() for name in virsh_read(virsh, env, "list", "--all", "--name").splitlines()
+               if name.strip()}
+    if (PTY_DOMAIN_ADDRESS in values) != (PTY_VM in domains):
+        raise Refused("Disposable domain presence differs from the destroy plan")
+    for name in domains - {PTY_VM}:
+        try:
+            xml = ET.fromstring(virsh_read(virsh, env, "dumpxml", name))
+        except ET.ParseError as exc:
+            raise Refused(f"Cannot parse domain XML for {name}") from exc
+        if (any(source.get("network") == PTY_NETWORK for source in
+                xml.findall("./devices/interface/source")) or
+                any(source.get("pool") == PTY_POOL or
+                    source.get("file", "").startswith(f"{PTY_POOL_PATH}/") for source in
+                    xml.findall("./devices/disk/source"))):
+            raise Refused(f"Other domain {name} depends on disposable network or pool storage")
+    if pool is not None:
+        try:
+            xml = ET.fromstring(virsh_read(virsh, env, "pool-dumpxml", PTY_POOL))
+        except ET.ParseError as exc:
+            raise Refused("Cannot parse disposable pool XML") from exc
+        if (not pool.get("uuid") or xml.findtext("./uuid") != pool["uuid"] or
+                xml.findtext("./target/path") != PTY_POOL_PATH):
+            raise Refused("Disposable pool UUID or path differs from state")
+        expected_volumes = set()
+        for address, name in ((f'module.compute.libvirt_volume.vm_disk["{PTY_VM}"]', f"{PTY_VM}.qcow2"),
+                              (f'module.compute.libvirt_volume.cloudinit_iso["{PTY_VM}"]', f"{PTY_VM}-cloudinit.iso")):
+            if address in values:
+                expected_volumes.add(name)
+        volume_lines = virsh_read(virsh, env, "vol-list", "--pool", PTY_POOL).splitlines()
+        if (len(volume_lines) < 2 or volume_lines[0].split() != ["Name", "Path"] or
+                set(volume_lines[1].strip()) != {"-"}):
+            raise Refused("Cannot parse disposable pool volume inventory")
+        actual_volumes = {line.split()[0] for line in volume_lines[2:] if line.strip()}
+        if actual_volumes != expected_volumes:
+            raise Refused("Disposable pool volumes differ from state-owned plan resources")
+    if network is not None:
+        try:
+            xml = ET.fromstring(virsh_read(virsh, env, "net-dumpxml", PTY_NETWORK))
+        except ET.ParseError as exc:
+            raise Refused("Cannot parse disposable network XML") from exc
+        bridge = xml.find("./bridge")
+        ip = xml.find("./ip")
+        if (not network.get("uuid") or xml.findtext("./uuid") != network["uuid"] or
+                bridge is None or bridge.get("name") != PTY_BRIDGE or
+                ip is None or ip.get("address") != "192.168.125.1" or
+                ip.get("netmask") != "255.255.255.0"):
+            raise Refused("Disposable network UUID, bridge or subnet differs from state")
+
+
+def plan_prior_addresses(data):
+    root_module = field(data, "prior_state", "values", "root_module")
+    if not isinstance(root_module, dict):
+        raise Refused("Saved plan lacks a readable prior state")
+    addresses = set()
+
+    def walk(module):
+        for resource in module.get("resources", []):
+            if not isinstance(resource, dict) or not isinstance(resource.get("address"), str):
+                raise Refused("Saved plan has malformed prior state resources")
+            addresses.add(resource["address"])
+        for child in module.get("child_modules", []):
+            if not isinstance(child, dict):
+                raise Refused("Saved plan has malformed prior state modules")
+            walk(child)
+
+    walk(root_module)
+    return addresses
+
+
+def inspect_pty_plan(terraform, virsh, root, env, operation, descriptor):
+    """Accept only a fixed, creation-only or cleanup-only saved plan."""
+    result = subprocess.run([terraform, f"-chdir={root}", "show", "-json",
+                             f"/proc/self/fd/{descriptor}"], cwd=ROOT, env=env,
+                            pass_fds=(descriptor,), capture_output=True, text=True, check=False)
+    if result.returncode:
+        raise Refused(f"Cannot inspect sealed PTY plan: exit {result.returncode}")
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise Refused("Saved plan did not produce valid JSON") from exc
+    if not isinstance(data, dict):
+        raise Refused("Saved plan must be a JSON object")
+    variables = data.get("variables")
+    if (not isinstance(variables, dict) or
+            field(variables, "libvirt_uri", "value") != SYSTEM_URI or
+            field(variables, "base_image", "value") != PTY_BASE or
+            field(variables, "base_image_sha256", "value") != PTY_SHA256 or
+            field(variables, "pool_group_id", "value") != "64055"):
+        raise Refused("PTY plan has unexpected provider URI, image or host group inputs")
+    providers = field(data, "configuration", "provider_config")
+    provider = field(providers, "libvirt")
+    if (not isinstance(providers, dict) or set(providers) != {"libvirt"} or
+            field(provider, "full_name") != "registry.terraform.io/dmacvicar/libvirt" or
+            field(provider, "version_constraint") != "0.9.9" or
+            field(provider, "expressions", "uri", "references") != ["var.libvirt_uri"]):
+        raise Refused("PTY plan does not bind its libvirt provider to the reviewed local URI")
+    if data.get("resource_drift"):
+        raise Refused("PTY plan contains resource drift; inspect before any action")
+    prior_addresses = plan_prior_addresses(data)
+    if operation == "bootstrap" and prior_addresses:
+        raise Refused("Bootstrap plan has prior managed state")
+
+    changes = data.get("resource_changes")
+    if not isinstance(changes, list) or not changes:
+        raise Refused("PTY plan must contain managed resource changes")
+    addresses = [change.get("address") for change in changes if isinstance(change, dict)]
+    requested = set(addresses)
+    if len(addresses) != len(changes) or len(requested) != len(addresses):
+        raise Refused("PTY plan contains missing, duplicate or out-of-scope resource addresses")
+    if operation == "recover":
+        if not requested <= PTY_ADDRESSES - {PTY_DOMAIN_ADDRESS} or prior_addresses != requested:
+            raise Refused("Partial recovery must delete only the complete state-owned, non-domain subset")
+    elif requested != PTY_ADDRESSES or (operation == "cleanup" and prior_addresses != PTY_ADDRESSES):
+        raise Refused("PTY bootstrap/cleanup plan must contain exactly six expected resource changes")
+
+    expected_action = "create" if operation == "bootstrap" else "delete"
+    values = {}
+    for change in changes:
+        details = change.get("change")
+        if (change.get("mode") != "managed" or
+                change.get("provider_name") != "registry.terraform.io/dmacvicar/libvirt" or
+                not isinstance(details, dict) or details.get("actions") != [expected_action]):
+            raise Refused("PTY plan contains an unexpected provider or action")
+        if operation == "bootstrap" and details.get("before") is not None:
+            raise Refused("Bootstrap plan must not replace an existing resource")
+        if operation != "bootstrap" and details.get("after") is not None:
+            raise Refused("Destroy plan must only delete disposable resources")
+        values[change["address"]] = details.get("after" if operation == "bootstrap" else "before")
+
+    pool = values.get("libvirt_pool.pty_regression")
+    network = values.get("libvirt_network.pty_regression")
+    disk = values.get(f'module.compute.libvirt_volume.vm_disk["{PTY_VM}"]')
+    cloudinit = values.get(f'module.compute.libvirt_cloudinit_disk.commoninit["{PTY_VM}"]')
+    iso = values.get(f'module.compute.libvirt_volume.cloudinit_iso["{PTY_VM}"]')
+    domain = values.get(PTY_DOMAIN_ADDRESS)
+    if not all(isinstance(value, dict) for value in values.values()):
+        raise Refused("PTY plan has incomplete resource values")
+    if operation == "recover" and (disk is not None or iso is not None) and pool is None:
+        raise Refused("Recovery of pool volumes requires ownership of the disposable pool")
+    if pool is not None and (pool.get("name") != PTY_POOL or pool.get("type") != "dir" or
+                            field(pool, "target", "path") != PTY_POOL_PATH):
+        raise Refused("PTY plan targets an unexpected pool")
+    if network is not None and (network.get("name") != PTY_NETWORK or
+                                field(network, "bridge", "name") != PTY_BRIDGE or
+                                field(network, "forward", "mode") != "nat"):
+        raise Refused("PTY plan targets an unexpected network or bridge")
+    if network is not None:
+        ips = network.get("ips")
+        if (not isinstance(ips, list) or len(ips) != 1 or not isinstance(ips[0], dict) or
+                ips[0].get("address") != "192.168.125.1" or
+                ips[0].get("netmask") != "255.255.255.0" or
+                field(ips[0], "dhcp", "hosts") is None):
+            raise Refused("PTY plan targets an unexpected subnet")
+        hosts = field(ips[0], "dhcp", "hosts")
+        ranges = field(ips[0], "dhcp", "ranges")
+        if (not isinstance(hosts, list) or len(hosts) != 1 or not isinstance(hosts[0], dict) or
+                {key: hosts[0].get(key) for key in ("name", "mac", "ip")} != {
+                    "name": PTY_VM, "mac": "52:54:00:cc:00:01", "ip": "192.168.125.10"} or
+                not isinstance(ranges, list) or len(ranges) != 1 or not isinstance(ranges[0], dict) or
+                ranges[0].get("start") != "192.168.125.100" or
+                ranges[0].get("end") != "192.168.125.200"):
+            raise Refused("PTY plan has unexpected DHCP reservations")
+    if disk is not None and (disk.get("name") != f"{PTY_VM}.qcow2" or disk.get("pool") != PTY_POOL or
+                             disk.get("capacity") != 20 * 1024 * 1024 * 1024 or
+                             field(disk, "backing_store", "path") != PTY_BASE or
+                             field(disk, "backing_store", "format", "type") != "qcow2"):
+        raise Refused("PTY plan has an unexpected overlay or backing image")
+    if (iso is not None and (iso.get("name") != f"{PTY_VM}-cloudinit.iso" or iso.get("pool") != PTY_POOL)) or \
+            (cloudinit is not None and cloudinit.get("name") != f"{PTY_VM}-cloudinit"):
+        raise Refused("PTY plan has unexpected cloud-init media")
+    if domain is not None and (domain.get("name") != PTY_VM or domain.get("type") != "kvm"):
+        raise Refused("PTY plan targets an unexpected domain")
+
+    if operation == "bootstrap":
+        devices = domain.get("devices")
+        channels = field(devices, "channels")
+        interfaces = field(devices, "interfaces")
+        if ("instance-id: iid-pty-regression-01" not in (cloudinit.get("meta_data") or "") or
+                domain.get("running") is not True or domain.get("memory") != 2048 or
+                domain.get("memory_unit") != "MiB" or domain.get("vcpu") != 2 or
+                field(devices, "consoles") != [] or
+                not isinstance(channels, list) or len(channels) != 1 or
+                field(channels[0], "target", "virt_io", "name") != "org.qemu.guest_agent.0" or
+                not isinstance(interfaces, list) or len(interfaces) != 1 or
+                field(interfaces[0], "mac", "address") != "52:54:00:cc:00:01" or
+                field(interfaces[0], "source", "network", "network") != PTY_NETWORK):
+            raise Refused("Bootstrap plan does not request the reviewed guest-agent/console/VM settings")
+    elif operation == "cleanup":
+        if pty_state_addresses(terraform, root, env) != PTY_ADDRESSES:
+            raise Refused("Cleanup requires all six resources in the current disposable state")
+        expected_uuid = domain.get("uuid")
+        if not expected_uuid or virsh_read(virsh, env, "domuuid", PTY_VM).strip() != expected_uuid:
+            raise Refused("Cleanup domain UUID does not match local libvirt")
+        pty_live_ownership(virsh, env, values)
+        return expected_uuid, requested, values
+    else:
+        pty_recovery_state(terraform, virsh, root, env, requested)
+        pty_live_ownership(virsh, env, values)
+        return None, requested, values
+    return None, requested, values
+
+
+def main():
+    if len(sys.argv) != 3 or sys.argv[1] not in OPERATIONS | {"validate-tools"}:
+        raise Refused("Usage: bin/operate <apply|destroy|configure|snapshot|build|up|bootstrap|cleanup|recover|validate-tools> <environment>")
+    operation, environment = sys.argv[1:]
+    if environment not in ENVIRONMENTS:
+        raise Refused(f"Unknown environment: {environment}")
+    if operation != "validate-tools" and operation not in ALLOWED_OPERATIONS[environment]:
+        raise Refused(f"{operation} is not permitted for {environment}")
+
+    # The config/lock paths are anchored to this controller, never to cwd or HOME.
+    try:
+        config = json.loads(CONFIG.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise Refused(f"Configure and review {CONFIG}: {exc}") from exc
+    if not isinstance(config, dict):
+        raise Refused(f"Expected a JSON object in {CONFIG}")
+    if operation == "validate-tools":
+        for name in ("terraform", "virsh", "ansible_playbook", "packer"):
+            print(f"{name}: {tool(config, name)}")
+        print(f"Environment: {environment}; root: {ENVIRONMENTS[environment]}")
+        return 0
+    lock = ROOT / ".local-operations.lock"
+    with lock.open("a+") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise Refused("Another operation controller is active in this checkout") from exc
+        root = ENVIRONMENTS[environment]
+        needed = {
+            "apply": ("terraform",), "destroy": ("terraform",),
+            "configure": ("ansible_playbook",), "build": ("packer",),
+            "snapshot": ("terraform", "virsh"),
+            "up": ("terraform", "virsh", "ansible_playbook"),
+            "bootstrap": ("terraform", "virsh"), "cleanup": ("terraform", "virsh"),
+            "recover": ("terraform", "virsh"),
+        }[operation]
+        tools = {name: tool(config, name) for name in needed}
+        env = child_environment(config, operation, environment)
+        if environment == "k3s-lab" and operation in ("apply", "destroy", "up"):
+            if not Path(env["TMPDIR"]).is_dir():
+                raise Refused(f"K3s temporary directory must already exist: {env['TMPDIR']}")
+        if operation in ("apply", "destroy", "up") and not (root / "terraform.tfstate").is_file():
+            raise Refused(f"State missing for {environment}; refusing to manage existing infrastructure")
+
+        if operation in ("bootstrap", "cleanup", "recover"):
+            pty_state_guard(root, operation)
+            if operation == "bootstrap":
+                pty_bootstrap_collisions(tools["virsh"], env)
+            filename = {"bootstrap": "pty-regression.tfplan",
+                        "cleanup": "pty-regression-destroy.tfplan",
+                        "recover": "pty-regression-recovery.tfplan"}[operation]
+            plan = root / filename
+            with sealed_pty_plan(plan) as (descriptor, digest):
+                expected_uuid, addresses, values = inspect_pty_plan(tools["terraform"], tools["virsh"],
+                                                                     root, env, operation, descriptor)
+                command = [tools["terraform"], f"-chdir={root}", "apply", f"/proc/self/fd/{descriptor}"]
+                token = f"{operation} pty-regression {digest}"
+                confirm(token, f"saved plan={plan}; SHA-256={digest}; {len(addresses)} "
+                               f"{('creates' if operation == 'bootstrap' else 'deletes')}; "
+                               f"sealed command={shlex.join(command)}")
+                if hashlib.sha256(read_saved_plan(plan)).hexdigest() != digest:
+                    raise Refused("Saved plan path changed after inspection; no execution")
+                pty_state_guard(root, operation)
+                if operation == "bootstrap":
+                    pty_bootstrap_collisions(tools["virsh"], env)
+                elif operation == "recover":
+                    pty_recovery_state(tools["terraform"], tools["virsh"], root, env, addresses)
+                    pty_live_ownership(tools["virsh"], env, values)
+                else:
+                    if pty_state_addresses(tools["terraform"], root, env) != PTY_ADDRESSES:
+                        raise Refused("Cleanup state changed after approval")
+                    if virsh_read(tools["virsh"], env, "domuuid", PTY_VM).strip() != expected_uuid:
+                        raise Refused("Cleanup domain UUID changed after approval")
+                    pty_live_ownership(tools["virsh"], env, values)
+                run(command, cwd=ROOT, env=env, pass_fds=(descriptor,))
+        elif operation == "build":
+            command = [tools["packer"], "build", "."]
+            description = (f"Ubuntu image build; cwd={ROOT / 'packer'}; "
+                           f"seed={ROOT / 'packer' / 'create-seed.sh'}; command={shlex.join(command)}")
+            confirm("build ubuntu-servers", description)
+            run(["/bin/bash", str(ROOT / "packer" / "create-seed.sh")], cwd=ROOT / "packer", env=env)
+            run(command, cwd=ROOT / "packer", env=env)
+        elif operation in ("apply", "destroy"):
+            command = [tools["terraform"], f"-chdir={root}", operation]
+            confirm(f"{operation} {environment}", f"state={root / 'terraform.tfstate'}; command={shlex.join(command)}")
+            run(command, cwd=ROOT, env=env)
+        elif operation == "configure":
+            command = [tools["ansible_playbook"], "-i",
+                       "inventories/terraform.py" if environment == "k3s-lab" else "inventories/ubuntu-servers.py",
+                       "playbooks/site.yaml" if environment == "k3s-lab" else "playbooks/ubuntu-servers.yaml"]
+            confirm(f"configure {environment}", f"inventory/playbook={shlex.join(command)}; cwd={ROOT / 'ansible'}")
+            run(command, cwd=ROOT / "ansible", env=env)
+        elif operation == "snapshot":
+            name = os.environ.get("VM", "")
+            expected_uuid = snapshot_vm(name, tools["terraform"], tools["virsh"], root, env)
+            command = [tools["virsh"], "-c", SYSTEM_URI, "snapshot-create-as", name,
+                       f"snap-{datetime.now().strftime('%Y%m%d-%H%M%S')}", "--atomic"]
+            confirm(f"snapshot {environment} {name}",
+                    f"verified VM={name}, UUID={expected_uuid}, state={root}; command={shlex.join(command)}")
+            run(command, cwd=ROOT, env=env)
+        else:  # up: one process, independent approvals and no rollback
+            run([tools["virsh"], "-c", SYSTEM_URI, "pool-info", "lab"], cwd=ROOT, env=env)
+            key = config.get("k3s_ssh_public_key")
+            if not isinstance(key, str) or not Path(key).is_absolute() or not Path(key).is_file():
+                raise Refused("Configure an existing absolute k3s_ssh_public_key")
+            tf = [tools["terraform"], f"-chdir={root}", "apply"]
+            confirm("apply k3s-lab", f"state={root / 'terraform.tfstate'}; command={shlex.join(tf)}")
+            run(tf, cwd=ROOT, env=env)
+            ansible = [tools["ansible_playbook"], "-i", "inventories/terraform.py", "playbooks/site.yaml"]
+            confirm("configure k3s-lab", f"cwd={ROOT / 'ansible'}; command={shlex.join(ansible)}")
+            run(ansible, cwd=ROOT / "ansible", env=env)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("Interrupted before completion", file=sys.stderr)
+        sys.exit(130)
+    except Refused as exc:
+        print(f"Refused: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except ChildFailed as exc:
+        sys.exit(exc.status)
+    except OSError as exc:
+        print(f"Operation could not start or complete: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as exc:
+        print(f"Unexpected controller error ({type(exc).__name__}): {exc}", file=sys.stderr)
+        sys.exit(1)

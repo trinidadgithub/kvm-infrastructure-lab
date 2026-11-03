@@ -1,0 +1,7 @@
+---
+- name: Configure generic Ubuntu servers
+  hosts: ubuntu_servers
+  become: true
+
+  roles:
+    - ubuntu_baseline

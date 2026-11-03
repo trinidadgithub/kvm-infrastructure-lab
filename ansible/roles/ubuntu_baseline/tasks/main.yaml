@@ -1,0 +1,14 @@
+---
+- name: Install Ubuntu baseline packages
+  ansible.builtin.apt:
+    name: "{{ ubuntu_baseline_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Keep QEMU guest agent enabled and running
+  ansible.builtin.service:
+    name: qemu-guest-agent
+    enabled: true
+    state: started
+  when: ubuntu_baseline_manage_guest_agent | bool
